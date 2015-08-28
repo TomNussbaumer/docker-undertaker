@@ -1,2 +1,2 @@
 #!/bin/sh
-docker run -ti --rm $(cat REPO_AND_VERSION) "$@"
+docker run -ti --rm -v /var/run/docker.sock:/var/run/docker.sock $(cat REPO_AND_VERSION) "$@"
