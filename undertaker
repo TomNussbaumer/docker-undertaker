@@ -7,30 +7,18 @@
 # -o pipefail ... return value of pipes is last command with exitcode != 0
 set -euo pipefail
 
-
 # Verify that docker is reachable
 docker version 1>/dev/null
 
+#UT_IMAGE_EXCLUDES=${UT_IMAGE_EXCLUDES:-/etc/undertaker_image_excludes}
+#UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-/etc/undertaker_container_excludes}
 
-#EXCLUDE_IMAGES=${EXCLUDE_IMAGES:-/etc/undertaker-image-excludes}
-#EXCLUDE_CONTAINERS=${EXCLUDE_CONTAINERS:-/etc/undertaker-container-excludes}
-
-EXCLUDE_IMAGES=${EXCLUDE_IMAGES:-./exclude_images}
-EXCLUDE_CONTAINERS=${EXCLUDE_CONTAINERS:-./exclude_containers}
-STILL_FRESH_SECONDS=${STILL_FRESH_SECONDS:-3600}
-
-
-# elapsed time since a docker timestamp in seconds
-elapsed_time() {
-	# Docker timestamp format: 2015-08-27T10:37:28.520420364Z
-	local tmp="${1#\"}"                 # remove leading "
-	local tmp2="${tmp/T/ }"             # T -> ' '
-	local stripped_input="${tmp2:0:19}" # everything after seconds    
-	local then_secs=$(date -u --date "$stripped_input" "+%s")
-	local now_secs=$(date -u "+%s")
-
-	echo $(($now_secs - $then_secs))
-}
+UT_IMAGE_EXCLUDES=${UT_IMAGE_EXCLUDES:-./exclude_images}
+UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-./exclude_containers}
+UT_STILLWARM_SECONDS=${UT_STILLWARM_SECONDS:-3600}
+UT_SHOW_PROCESSED_EXCLUDES=${UT_SHOW_PROCESSED_EXCLUDES:-}
+UT_SHOW_EXCLUDED_TARGETS=${UT_SHOW_EXCLUDED_TARGETS:-}
+UT_PERFORM_REAPING=${UT_PERFORM_REAPING:-}
 
 # (1) remove empty lines
 # (2) remove comment-only lines
@@ -70,90 +58,239 @@ get_excluded_ids() {
 
 
 _compute_excluded_ids() {
-	declare exclusion_file="$1" list_to_process="$2"
+	declare exclusion_file="$1" list_to_process="$2" debug_title="$3"
 	if [ ! -f "$exclusion_file" ]; then
 		echo ""
 	else
 		local input=$(cat "$exclusion_file")
 		local excludes=$(preprocess_excludes "$input")
-		local list="$list_to_process"
-		get_excluded_ids "$list" "$excludes"
+
+		if [ -n "$UT_SHOW_PROCESSED_EXCLUDES" ]; then
+		   echo >&2 "[$debug_title]"
+		   echo >&2 "$excludes" 
+		fi
+		
+		if [ -z "excludes" ]; then
+			echo ""
+		else		
+			get_excluded_ids "$list_to_process" "$excludes"
+		fi
 	fi
 }	
 
-
 compute_excluded_image_ids() {
-	_compute_excluded_ids "$EXCLUDE_IMAGES" "$(get_image_list)"
+	_compute_excluded_ids "$UT_IMAGE_EXCLUDES" "$(get_image_list)" "images-excludes filters"
 }
 
 compute_excluded_container_ids() {
-	_compute_excluded_ids "$EXCLUDE_CONTAINERS" "$(get_container_list)"
-}
-
-
-get_all_containers() {
-  docker ps -a -q --no-trunc | sort | uniq
-}
-
-get_running_containers() {
-  docker ps -q --no-trunc | sort | uniq
+	_compute_excluded_ids "$UT_CONTAINER_EXCLUDES" "$(get_container_list)" "container-excludes filters"
 }
 
 get_list_difference() {
 	if [ -z "$2" ]; then
 		echo "$1"
+	elif [ -z "$1" ]; then
+		echo ""
 	else
 		echo "$1" | grep -v "$2" | sort | uniq
 	fi
 }
 
-EXCLUDED_IMAGE_IDS=$(compute_excluded_image_ids)
-EXCLUDED_CONTAINER_IDS=$(compute_excluded_container_ids)
-
-CONTAINERS_ALL=$(get_all_containers) || true
-CONTAINERS_RUNNING=$(get_running_containers) || true
-CONTAINERS_EXITED=$(get_list_difference "$CONTAINERS_ALL" "$CONTAINERS_RUNNING") || true
+# elapsed time since a docker timestamp in seconds
+elapsed_time() {
+	# Docker timestamp format: 2015-08-27T10:37:28.520420364Z
+	local tmp="${1#\"}"                 # remove leading "
+	local tmp2="${tmp/T/ }"             # T -> ' '
+	local stripped_input="${tmp2:0:19}" # everything after seconds    
+	local then_secs=$(date -u --date "$stripped_input" "+%s")
+	local now_secs=$(date -u "+%s")
+	echo $(($now_secs - $then_secs))
+}
 
 
 get_containers_to_reap() {
-	get_list_difference "$CONTAINERS_EXITED" "$EXCLUDED_CONTAINER_IDS" | while read line
+	declare all_containers="$1"
+
+    local running_containers=$(docker ps -q --no-trunc | sort)
+    local exited_containers=$(get_list_difference "$all_containers" "$running_containers")
+    local excluded_containers=$(compute_excluded_container_ids)
+
+	if [ -z "$exited_containers" ]; then
+		echo ""
+		return 0;
+	fi
+
+	local targets=""
+	if [ -z "$excluded_containers" ]; then
+		targets="$exited_containers"
+	else
+		targets=$(get_list_difference "$exited_containers" "$excluded_containers")
+	fi
+	
+	if [ -z "$targets" ]; then
+	   echo ""
+	   return 0;
+	fi
+
+	echo "$targets" | while read line
 	do
         if [ ${#line} -gt 10 ]; then
 			local exit_time=$(docker inspect -f "{{json .State.FinishedAt}}" "$line")
 			local elapsed=$(elapsed_time "$exit_time")
-			if [[ "$elapsed" -gt "$STILL_FRESH_SECONDS" ]]; then
+			if [[ "$elapsed" -gt "$UT_STILLWARM_SECONDS" ]]; then
 				echo $line
 			fi	
 		fi
 	done
 }
 
-CONTAINERS_REAP=$(get_containers_to_reap) || true
-CONTAINERS_KEEP=$(get_list_difference "$CONTAINERS_ALL" "$CONTAINERS_REAP") || true
+get_images_to_reap() {
+	declare containers_all="$1" containers_reap="$2"
+	
+	local containers_keep=$(get_list_difference "$containers_all" "$containers_reap")
+    local images_inuse=""
 
-IMAGES_INUSE=$(echo "$CONTAINERS_KEEP" | \
-              xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
-              sort | uniq | \
-              xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
-              sort | uniq) || true
+    if [ -n "$containers_keep" ]; then
+		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
+			echo >&2 "[keeping containers]"
 
-IMAGES_ALL=$(docker images -q --no-trunc | sort | uniq) || true
+			echo "$containers_keep" | while read line
+			do
+		        if [ ${#line} -gt 10 ]; then
+					local data=$(docker inspect -f "{{.Name}} {{.Id}}" "$line" | sed 's/^\///')
+					local d_name=$(echo "$data" | cut -d ' ' -f1)
+					local d_id=$(echo "$data" | cut -d ' ' -f2 | cut -c1-12)
+					printf >&2 "%12s   %s\n" "$d_id" "$d_name"
+				fi
+			done		
 
-#echo "all=$IMAGES_ALL"
-#echo "inuse=$IMAGES_INUSE"
-#DIFF=$(get_list_difference "$IMAGES_ALL" "$IMAGES_INUSE")
-#echo "diff=$DIFF"
+		fi
 
-e#cho "excluded=$EXCLUDED_IMAGE_IDS"
+		image_inuse=$(echo "$containers_keep" | \
+		              xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
+		              sort | uniq | \
+			          xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
+			          sort | uniq) || true
+	fi
+	
+	local images_all=$(docker images -q --no-trunc | sort | uniq) || true
+	
+	local targets=$(get_list_difference "$images_all" "$images_inuse")
 
-IMAGES_REAP=$(get_list_difference "$IMAGES_ALL" "$IMAGES_INUSE" | grep -v "$EXCLUDED_IMAGE_IDS") || true
+	if [ -z "$targets" ]; then
+		echo ""
+		return 0
+	fi
 
-#echo "reap=$IMAGES_REAP"
+    local excluded=$(compute_excluded_image_ids)
 
-# Reap containers.
-echo "$CONTAINERS_REAP" | xargs -n 1 docker rm --volumes=true  &>/dev/null || true
+	if [ -z "$excluded" ]; then
+		echo "$targets"
+	else
 
-# Reap images.
-echo "$IMAGES_REAP" | xargs -n 1 docker rmi  &>/dev/null || true
+		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
+			echo >&2 "[keeping images]"
+			# THERE is no other way to get the repo/tag for an images :(
+			local all=$(docker images | tail -n+2 | \
+	                    sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
 
+			local keep=$(echo "$excluded" | cut -c1-12)
+			echo "$all" | grep "$keep" >&2
+		fi
+
+	    echo $targets | grep -v "$excluded"
+	fi
+}
+
+
+process_all() {
+	local containers_all=$(docker ps -a -q --no-trunc | sort | uniq) || true
+	local containers_reap=$(get_containers_to_reap "$containers_all")
+    local images_reap=$(get_images_to_reap "$containers_all" "$containers_reap")
+
+	if [ -n "$UT_PERFORM_REAPING" ]; then
+		# Reap containers
+		echo "$containers_reap" | xargs -n 1 docker rm --volumes=true  &>/dev/null || true
+
+		# Reap images
+		echo "$images_reap" | xargs -n 1 docker rmi  &>/dev/null || true
+	fi
+}
+
+
+show_usage() {
+	cat <<- END_OF_TEXT
+		USAGE: $0 [OPTIONS]
+
+		options:
+		
+		  -i pattern   exclude matching images from reaping
+		  -c pattern   exclude matching containers from reaping
+		  -e           show processed exclude lists
+		  -E           show excluded containers and images
+		  -w seconds   wait time in seconds before reaping stopped containers
+		               (default: $UT_STILLWARM_SECONDS)
+		  -x           PERFORM reaping - for safety reasons reaping is not done
+		               automatically. you have to specify this flag
+
+		NOTE: exclusion patterns will be processed with grep against the
+		      corresponding lists
+
+		environment variables:
+
+		  TRACE                 turn on line-level tracing
+		  UT_IMAGE_EXCLUDES     file containing image excludes
+		                        (default: $UT_IMAGE_EXCLUDES)
+		  UT_CONTAINER_EXCLUDES file containing container excludes
+		                        (default: $UT_CONTAINER_EXCLUDES)
+          UT_STILLWARM_SECONDS  how long will be containers ignored after exit,
+                                same as option -w 
+		                        (default: $UT_STILLWARM_SECONDS)
+
+		END_OF_TEXT
+}
+
+
+main() {
+	if [ $# -eq 0 ]; then 
+	  show_usage
+	  exit 1
+	fi
+	
+	while getopts ":i:c:w:eEx" opt; do
+		case $opt in
+			i)	# exclude images
+				echo "$OPTARG" >> "$UT_IMAGE_EXCLUDES"
+				;;
+			c)	# exclude containers
+				echo "$OPTARG" >> "$UT_CONTAINER_EXCLUDES"
+				;;
+			w)	# wait time in seconds
+				UT_STILLWARM_SECONDS="$OPTARG"
+				;;
+			e)	# show exclude lists
+				UT_SHOW_PROCESSED_EXCLUDES="on"
+				;;
+			E)  # show excluded targets
+				UT_SHOW_EXCLUDED_TARGETS="on"
+				;;
+			x)	# perform reaping
+				UT_PERFORM_REAPING="on"
+				;;
+
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				exit 1
+				;;
+			:)
+				echo "Option -$OPTARG requires an argument." >&2
+				exit 1
+				;;
+		esac
+	done
+
+	process_all
+}
+
+main "$@"
 
