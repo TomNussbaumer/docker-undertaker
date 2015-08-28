@@ -1,0 +1,159 @@
+#!/bin/bash
+
+[[ "$TRACE" ]] && set -x
+
+# -e          ... exit on exitcodes != 0
+# -u          ... exit on unset variables
+# -o pipefail ... return value of pipes is last command with exitcode != 0
+set -euo pipefail
+
+
+# Verify that docker is reachable
+docker version 1>/dev/null
+
+
+#EXCLUDE_IMAGES=${EXCLUDE_IMAGES:-/etc/undertaker-image-excludes}
+#EXCLUDE_CONTAINERS=${EXCLUDE_CONTAINERS:-/etc/undertaker-container-excludes}
+
+EXCLUDE_IMAGES=${EXCLUDE_IMAGES:-./exclude_images}
+EXCLUDE_CONTAINERS=${EXCLUDE_CONTAINERS:-./exclude_containers}
+STILL_FRESH_SECONDS=${STILL_FRESH_SECONDS:-3600}
+
+
+# elapsed time since a docker timestamp in seconds
+elapsed_time() {
+	# Docker timestamp format: 2015-08-27T10:37:28.520420364Z
+	local tmp="${1#\"}"                 # remove leading "
+	local tmp2="${tmp/T/ }"             # T -> ' '
+	local stripped_input="${tmp2:0:19}" # everything after seconds    
+	local then_secs=$(date -u --date "$stripped_input" "+%s")
+	local now_secs=$(date -u "+%s")
+
+	echo $(($now_secs - $then_secs))
+}
+
+# (1) remove empty lines
+# (2) remove comment-only lines
+# (3) remove trailing comments
+# (4) remove trailing spaces
+preprocess_excludes () {
+	echo "$1" | sed -e '/^ *$/d' \
+	                -e '/^ *##*.*$/d' \
+	                -e 's/^\(.*\)#.*$/\1/g' \
+	                -e 's/ *$//g'
+}
+
+# (1) fetch list from docker
+# (2) remove header
+# (3) reformat to [id] [name]:[tag] 
+get_image_list() {
+	docker images --no-trunc | tail -n+2 | \
+	                sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq
+}
+
+# returns container list in format: [id] [name]
+get_container_list() {
+  docker ps -a --no-trunc --format='{{ .ID}} {{ .Names}}' | sort | uniq
+}
+
+# for debugging
+get_excluded() {
+	declare list="$1" excludes="$2"
+	echo "$list" | grep "$excludes"
+}
+
+# returns sorted list of ids to exclude prefixed with '^'
+get_excluded_ids() {
+	declare list="$1" excludes="$2"
+	echo "$list" | grep "$excludes" 2>/dev/null | cut -d' ' -f1 | sort | uniq
+}
+
+
+_compute_excluded_ids() {
+	declare exclusion_file="$1" list_to_process="$2"
+	if [ ! -f "$exclusion_file" ]; then
+		echo ""
+	else
+		local input=$(cat "$exclusion_file")
+		local excludes=$(preprocess_excludes "$input")
+		local list="$list_to_process"
+		get_excluded_ids "$list" "$excludes"
+	fi
+}	
+
+
+compute_excluded_image_ids() {
+	_compute_excluded_ids "$EXCLUDE_IMAGES" "$(get_image_list)"
+}
+
+compute_excluded_container_ids() {
+	_compute_excluded_ids "$EXCLUDE_CONTAINERS" "$(get_container_list)"
+}
+
+
+get_all_containers() {
+  docker ps -a -q --no-trunc | sort | uniq
+}
+
+get_running_containers() {
+  docker ps -q --no-trunc | sort | uniq
+}
+
+get_list_difference() {
+	if [ -z "$2" ]; then
+		echo "$1"
+	else
+		echo "$1" | grep -v "$2" | sort | uniq
+	fi
+}
+
+EXCLUDED_IMAGE_IDS=$(compute_excluded_image_ids)
+EXCLUDED_CONTAINER_IDS=$(compute_excluded_container_ids)
+
+CONTAINERS_ALL=$(get_all_containers) || true
+CONTAINERS_RUNNING=$(get_running_containers) || true
+CONTAINERS_EXITED=$(get_list_difference "$CONTAINERS_ALL" "$CONTAINERS_RUNNING") || true
+
+
+get_containers_to_reap() {
+	get_list_difference "$CONTAINERS_EXITED" "$EXCLUDED_CONTAINER_IDS" | while read line
+	do
+        if [ ${#line} -gt 10 ]; then
+			local exit_time=$(docker inspect -f "{{json .State.FinishedAt}}" "$line")
+			local elapsed=$(elapsed_time "$exit_time")
+			if [[ "$elapsed" -gt "$STILL_FRESH_SECONDS" ]]; then
+				echo $line
+			fi	
+		fi
+	done
+}
+
+CONTAINERS_REAP=$(get_containers_to_reap) || true
+CONTAINERS_KEEP=$(get_list_difference "$CONTAINERS_ALL" "$CONTAINERS_REAP") || true
+
+IMAGES_INUSE=$(echo "$CONTAINERS_KEEP" | \
+              xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
+              sort | uniq | \
+              xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
+              sort | uniq) || true
+
+IMAGES_ALL=$(docker images -q --no-trunc | sort | uniq) || true
+
+#echo "all=$IMAGES_ALL"
+#echo "inuse=$IMAGES_INUSE"
+#DIFF=$(get_list_difference "$IMAGES_ALL" "$IMAGES_INUSE")
+#echo "diff=$DIFF"
+
+e#cho "excluded=$EXCLUDED_IMAGE_IDS"
+
+IMAGES_REAP=$(get_list_difference "$IMAGES_ALL" "$IMAGES_INUSE" | grep -v "$EXCLUDED_IMAGE_IDS") || true
+
+#echo "reap=$IMAGES_REAP"
+
+# Reap containers.
+echo "$CONTAINERS_REAP" | xargs -n 1 docker rm --volumes=true  &>/dev/null || true
+
+# Reap images.
+echo "$IMAGES_REAP" | xargs -n 1 docker rmi  &>/dev/null || true
+
+
