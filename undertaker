@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# NOTE:
+#
+# since this script makes heavy use of grep it is very important which variant
+# of grep is installed. The builtin grep of busybox will NOT work!
+
+
 [[ "$TRACE" ]] && set -x
 
 # -e          ... exit on exitcodes != 0
@@ -10,15 +16,15 @@ set -euo pipefail
 # Verify that docker is reachable
 docker version 1>/dev/null
 
-#UT_IMAGE_EXCLUDES=${UT_IMAGE_EXCLUDES:-/etc/undertaker_image_excludes}
-#UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-/etc/undertaker_container_excludes}
-
-UT_IMAGE_EXCLUDES=${UT_IMAGE_EXCLUDES:-./exclude_images}
-UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-./exclude_containers}
+UT_IMAGE_EXCLUDES=${UT_IMAGE_EXCLUDES:-/etc/undertaker/image-excludes}
+UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-/etc/undertaker/container-excludes}
 UT_STILLWARM_SECONDS=${UT_STILLWARM_SECONDS:-3600}
 UT_SHOW_PROCESSED_EXCLUDES=${UT_SHOW_PROCESSED_EXCLUDES:-}
 UT_SHOW_EXCLUDED_TARGETS=${UT_SHOW_EXCLUDED_TARGETS:-}
 UT_PERFORM_REAPING=${UT_PERFORM_REAPING:-}
+
+## strange, but required for alpine linux
+export GREP=$(which grep)
 
 # (1) remove empty lines
 # (2) remove comment-only lines
@@ -47,19 +53,22 @@ get_container_list() {
 # for debugging
 get_excluded() {
 	declare list="$1" excludes="$2"
-	echo "$list" | grep "$excludes"
+	echo "$list" | $GREP "$excludes"
 }
 
 # returns sorted list of ids to exclude prefixed with '^'
 get_excluded_ids() {
 	declare list="$1" excludes="$2"
-	echo "$list" | grep "$excludes" 2>/dev/null | cut -d' ' -f1 | sort | uniq
+	echo "$list" | $GREP "$excludes" 2>/dev/null | cut -d' ' -f1 | sort | uniq
 }
-
 
 _compute_excluded_ids() {
 	declare exclusion_file="$1" list_to_process="$2" debug_title="$3"
 	if [ ! -f "$exclusion_file" ]; then
+		if [ -n "$UT_SHOW_PROCESSED_EXCLUDES" ]; then
+		   echo >&2 "[$debug_title] exclusion file [$exclusion_file] not found"
+		fi
+
 		echo ""
 	else
 		local input=$(cat "$exclusion_file")
@@ -92,7 +101,7 @@ get_list_difference() {
 	elif [ -z "$1" ]; then
 		echo ""
 	else
-		echo "$1" | grep -v "$2" | sort | uniq
+		echo "$1" | $GREP -v "$2" | sort | uniq
 	fi
 }
 
@@ -106,7 +115,6 @@ elapsed_time() {
 	local now_secs=$(date -u "+%s")
 	echo $(($now_secs - $then_secs))
 }
-
 
 get_containers_to_reap() {
 	declare all_containers="$1"
@@ -144,6 +152,23 @@ get_containers_to_reap() {
 	done
 }
 
+print_kept_images() {
+	if [ -z "$1" ] && [ -z "$2" ]; then
+		echo >&2 "[keeping images] NONE"
+		return 0
+	fi
+	local excluded=$(echo "$1"; echo "$2")
+
+	echo >&2 "[keeping images]"
+	# THERE is no other way to get the repo/tag for an images :(
+	local all=$(docker images -a | tail -n+2 | \
+                sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
+
+	local keep=$(echo "$excluded" | cut -c1-12 | sort | uniq)	
+	local result=$(echo "$all" | $GREP "$keep") 	
+	echo >&2 "$result"
+}	
+
 get_images_to_reap() {
 	declare containers_all="$1" containers_reap="$2"
 	
@@ -160,48 +185,41 @@ get_images_to_reap() {
 					local data=$(docker inspect -f "{{.Name}} {{.Id}}" "$line" | sed 's/^\///')
 					local d_name=$(echo "$data" | cut -d ' ' -f1)
 					local d_id=$(echo "$data" | cut -d ' ' -f2 | cut -c1-12)
-					printf >&2 "%12s   %s\n" "$d_id" "$d_name"
+					printf >&2 "%12s %s\n" "$d_id" "$d_name"
 				fi
 			done		
-
 		fi
 
-		image_inuse=$(echo "$containers_keep" | \
+		images_inuse=$(echo "$containers_keep" | \
 		              xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
 		              sort | uniq | \
 			          xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
 			          sort | uniq) || true
+	else
+		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
+			echo >&2 "[keeping containers] NONE"
+		fi
 	fi
 	
-	local images_all=$(docker images -q --no-trunc | sort | uniq) || true
-	
+	local images_all=$(docker images -q --no-trunc | sort | uniq) || true	
 	local targets=$(get_list_difference "$images_all" "$images_inuse")
+    local excluded=$(compute_excluded_image_ids)
+
+	if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
+		print_kept_images "$images_inuse" "$excluded"
+    fi
 
 	if [ -z "$targets" ]; then
 		echo ""
 		return 0
 	fi
 
-    local excluded=$(compute_excluded_image_ids)
-
 	if [ -z "$excluded" ]; then
 		echo "$targets"
 	else
-
-		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
-			echo >&2 "[keeping images]"
-			# THERE is no other way to get the repo/tag for an images :(
-			local all=$(docker images | tail -n+2 | \
-	                    sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
-
-			local keep=$(echo "$excluded" | cut -c1-12)
-			echo "$all" | grep "$keep" >&2
-		fi
-
-	    echo $targets | grep -v "$excluded"
+	    echo $targets | $GREP -v "$excluded"
 	fi
 }
-
 
 process_all() {
 	local containers_all=$(docker ps -a -q --no-trunc | sort | uniq) || true
@@ -214,9 +232,10 @@ process_all() {
 
 		# Reap images
 		echo "$images_reap" | xargs -n 1 docker rmi  &>/dev/null || true
+	else
+		echo "[INFO] nothing reaped. specify '-x' to perform reaping." 
 	fi
 }
-
 
 show_usage() {
 	cat <<- END_OF_TEXT
@@ -243,13 +262,11 @@ show_usage() {
 		                        (default: $UT_IMAGE_EXCLUDES)
 		  UT_CONTAINER_EXCLUDES file containing container excludes
 		                        (default: $UT_CONTAINER_EXCLUDES)
-          UT_STILLWARM_SECONDS  how long will be containers ignored after exit,
-                                same as option -w 
-		                        (default: $UT_STILLWARM_SECONDS)
+		  UT_STILLWARM_SECONDS  how long will be containers ignored after exit,
+		                        same as option -w (default: $UT_STILLWARM_SECONDS)
 
 		END_OF_TEXT
 }
-
 
 main() {
 	if [ $# -eq 0 ]; then 
