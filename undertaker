@@ -66,7 +66,7 @@ _compute_excluded_ids() {
 	declare exclusion_file="$1" list_to_process="$2" debug_title="$3"
 	if [ ! -f "$exclusion_file" ]; then
 		if [ -n "$UT_SHOW_PROCESSED_EXCLUDES" ]; then
-		   echo >&2 "[$debug_title] exclusion file [$exclusion_file] not found"
+			echo >&2 "[$debug_title] exclusion file [$exclusion_file] not found"
 		fi
 
 		echo ""
@@ -119,9 +119,9 @@ elapsed_time() {
 get_containers_to_reap() {
 	declare all_containers="$1"
 
-    local running_containers=$(docker ps -q --no-trunc | sort)
-    local exited_containers=$(get_list_difference "$all_containers" "$running_containers")
-    local excluded_containers=$(compute_excluded_container_ids)
+	local running_containers=$(docker ps -q --no-trunc | sort)
+	local exited_containers=$(get_list_difference "$all_containers" "$running_containers")
+	local excluded_containers=$(compute_excluded_container_ids)
 
 	if [ -z "$exited_containers" ]; then
 		echo ""
@@ -142,7 +142,7 @@ get_containers_to_reap() {
 
 	echo "$targets" | while read line
 	do
-        if [ ${#line} -gt 10 ]; then
+		if [ ${#line} -gt 10 ]; then
 			local exit_time=$(docker inspect -f "{{json .State.FinishedAt}}" "$line")
 			local elapsed=$(elapsed_time "$exit_time")
 			if [[ "$elapsed" -gt "$UT_STILLWARM_SECONDS" ]]; then
@@ -162,7 +162,7 @@ print_kept_images() {
 	echo >&2 "[keeping images]"
 	# THERE is no other way to get the repo/tag for an images :(
 	local all=$(docker images -a | tail -n+2 | \
-                sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
+	            sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
 
 	local keep=$(echo "$excluded" | cut -c1-12 | sort | uniq)	
 	local result=$(echo "$all" | $GREP "$keep") 	
@@ -173,15 +173,15 @@ get_images_to_reap() {
 	declare containers_all="$1" containers_reap="$2"
 	
 	local containers_keep=$(get_list_difference "$containers_all" "$containers_reap")
-    local images_inuse=""
+	local images_inuse=""
 
-    if [ -n "$containers_keep" ]; then
+	if [ -n "$containers_keep" ]; then
 		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
 			echo >&2 "[keeping containers]"
 
 			echo "$containers_keep" | while read line
 			do
-		        if [ ${#line} -gt 10 ]; then
+				if [ ${#line} -gt 10 ]; then
 					local data=$(docker inspect -f "{{.Name}} {{.Id}}" "$line" | sed 's/^\///')
 					local d_name=$(echo "$data" | cut -d ' ' -f1)
 					local d_id=$(echo "$data" | cut -d ' ' -f2 | cut -c1-12)
@@ -191,10 +191,10 @@ get_images_to_reap() {
 		fi
 
 		images_inuse=$(echo "$containers_keep" | \
-		              xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
-		              sort | uniq | \
-			          xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
-			          sort | uniq) || true
+		               xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
+                               sort | uniq | \
+		               xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
+		               sort | uniq) || true
 	else
 		if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
 			echo >&2 "[keeping containers] NONE"
@@ -203,11 +203,11 @@ get_images_to_reap() {
 	
 	local images_all=$(docker images -q --no-trunc | sort | uniq) || true	
 	local targets=$(get_list_difference "$images_all" "$images_inuse")
-    local excluded=$(compute_excluded_image_ids)
+	local excluded=$(compute_excluded_image_ids)
 
 	if [ -n "$UT_SHOW_EXCLUDED_TARGETS" ]; then
 		print_kept_images "$images_inuse" "$excluded"
-    fi
+	fi
 
 	if [ -z "$targets" ]; then
 		echo ""
@@ -224,7 +224,7 @@ get_images_to_reap() {
 process_all() {
 	local containers_all=$(docker ps -a -q --no-trunc | sort | uniq) || true
 	local containers_reap=$(get_containers_to_reap "$containers_all")
-    local images_reap=$(get_images_to_reap "$containers_all" "$containers_reap")
+	local images_reap=$(get_images_to_reap "$containers_all" "$containers_reap")
 
 	if [ -n "$UT_PERFORM_REAPING" ]; then
 		# Reap containers
@@ -270,8 +270,8 @@ show_usage() {
 
 main() {
 	if [ $# -eq 0 ]; then 
-	  show_usage
-	  exit 1
+		show_usage
+		exit 1
 	fi
 	
 	while getopts ":i:c:w:eEx" opt; do
@@ -288,7 +288,7 @@ main() {
 			e)	# show exclude lists
 				UT_SHOW_PROCESSED_EXCLUDES="on"
 				;;
-			E)  # show excluded targets
+			E)	# show excluded targets
 				UT_SHOW_EXCLUDED_TARGETS="on"
 				;;
 			x)	# perform reaping
