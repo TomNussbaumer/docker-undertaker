@@ -79,7 +79,7 @@ _compute_excluded_ids() {
 		   echo >&2 "$excludes" 
 		fi
 		
-		if [ -z "excludes" ]; then
+		if [ -z "$excludes" ]; then
 			echo ""
 		else		
 			get_excluded_ids "$list_to_process" "$excludes"
