@@ -1,16 +1,46 @@
 #!/bin/bash
 
-# NOTE:
+################################################################################
+#
+# Undertaker: Tool for Garbage Collect Docker Containers and Images
+#
+#-------------------------------------------------------------------------------
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2015 Tom Nussbaumer <thomas.nussbaumer@gmx.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+################################################################################
+
+# IMPORTANT NOTE:
 #
 # since this script makes heavy use of grep it is very important which variant
 # of grep is installed. The builtin grep of busybox will NOT work!
-
+#
 
 [[ "$TRACE" ]] && set -x
 
-# -e          ... exit on exitcodes != 0
-# -u          ... exit on unset variables
-# -o pipefail ... return value of pipes is last command with exitcode != 0
+# -e          - exit on exitcodes != 0
+# -u          - exit on unset variables
+# -o pipefail - return value of pipes is last command with exitcode != 0
 set -euo pipefail
 
 # Verify that docker is reachable
@@ -21,7 +51,7 @@ UT_CONTAINER_EXCLUDES=${UT_CONTAINER_EXCLUDES:-/etc/undertaker/container-exclude
 UT_STILLWARM_SECONDS=${UT_STILLWARM_SECONDS:-3600}
 UT_SHOW_PROCESSED_EXCLUDES=${UT_SHOW_PROCESSED_EXCLUDES:-}
 UT_SHOW_EXCLUDED_TARGETS=${UT_SHOW_EXCLUDED_TARGETS:-}
-UT_PERFORM_REAPING=${UT_PERFORM_REAPING:-}
+UT_TAKE_UNDER=${UT_TAKE_UNDER:-}
 
 ## strange, but required for alpine linux
 export GREP=$(which grep)
@@ -37,31 +67,13 @@ preprocess_excludes () {
 	                -e 's/ *$//g'
 }
 
-# (1) fetch list from docker
-# (2) remove header
-# (3) reformat to [id] [name]:[tag] 
-get_image_list() {
-	docker images --no-trunc | tail -n+2 | \
-	                sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq
-}
-
-# returns container list in format: [id] [name]
-get_container_list() {
-  docker ps -a --no-trunc --format='{{ .ID}} {{ .Names}}' | sort | uniq
-}
-
-# for debugging
-get_excluded() {
-	declare list="$1" excludes="$2"
-	echo "$list" | $GREP "$excludes"
-}
-
-# returns sorted list of ids to exclude prefixed with '^'
+# returns sorted list of ids to exclude
 get_excluded_ids() {
 	declare list="$1" excludes="$2"
 	echo "$list" | $GREP "$excludes" 2>/dev/null | cut -d' ' -f1 | sort | uniq
 }
 
+# internal helper
 _compute_excluded_ids() {
 	declare exclusion_file="$1" list_to_process="$2" debug_title="$3"
 	if [ ! -f "$exclusion_file" ]; then
@@ -85,16 +97,28 @@ _compute_excluded_ids() {
 			get_excluded_ids "$list_to_process" "$excludes"
 		fi
 	fi
-}	
+}
 
+# returns list of image ids to exclude
 compute_excluded_image_ids() {
-	_compute_excluded_ids "$UT_IMAGE_EXCLUDES" "$(get_image_list)" "images-excludes filters"
+	# (1) fetch list from docker
+	# (2) remove header
+	# (3) reformat to [id] [name]:[tag]
+	local image_list=$(docker images --no-trunc | tail -n+2 | \
+	                   sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
+
+	_compute_excluded_ids "$UT_IMAGE_EXCLUDES" "$image_list" "images-excludes filters"
 }
 
+# returns list of container ids to exclude
 compute_excluded_container_ids() {
-	_compute_excluded_ids "$UT_CONTAINER_EXCLUDES" "$(get_container_list)" "container-excludes filters"
+	local container_list=$(docker ps -a --no-trunc --format='{{ .ID}} {{ .Names}}' | sort | uniq)
+
+	_compute_excluded_ids "$UT_CONTAINER_EXCLUDES" "$container_list" "container-excludes filters"
 }
 
+# returns everthing from list 1 ($1) which is not in list 2 ($2)
+#         (sort and uniq abled before returning)
 get_list_difference() {
 	if [ -z "$2" ]; then
 		echo "$1"
@@ -110,13 +134,14 @@ elapsed_time() {
 	# Docker timestamp format: 2015-08-27T10:37:28.520420364Z
 	local tmp="${1#\"}"                 # remove leading "
 	local tmp2="${tmp/T/ }"             # T -> ' '
-	local stripped_input="${tmp2:0:19}" # everything after seconds    
+	local stripped_input="${tmp2:0:19}" # strip everything after seconds
 	local then_secs=$(date -u --date "$stripped_input" "+%s")
 	local now_secs=$(date -u "+%s")
 	echo $(($now_secs - $then_secs))
 }
 
-get_containers_to_reap() {
+# returns list of container ids to destroy
+get_containers_to_destroy() {
 	declare all_containers="$1"
 
 	local running_containers=$(docker ps -q --no-trunc | sort)
@@ -136,8 +161,8 @@ get_containers_to_reap() {
 	fi
 	
 	if [ -z "$targets" ]; then
-	   echo ""
-	   return 0;
+		echo ""
+		return 0;
 	fi
 
 	echo "$targets" | while read line
@@ -152,6 +177,7 @@ get_containers_to_reap() {
 	done
 }
 
+# print image which will be kept to stderr
 print_kept_images() {
 	if [ -z "$1" ] && [ -z "$2" ]; then
 		echo >&2 "[keeping images] NONE"
@@ -164,15 +190,16 @@ print_kept_images() {
 	local all=$(docker images -a | tail -n+2 | \
 	            sed 's/^\([^ ]*\) *\([^ ]*\) *\([^ ]*\).*/\3 \1:\2/' | sort | uniq)
 
-	local keep=$(echo "$excluded" | cut -c1-12 | sort | uniq)	
-	local result=$(echo "$all" | $GREP "$keep") 	
+	local keep=$(echo "$excluded" | cut -c1-12 | sort | uniq)
+	local result=$(echo "$all" | $GREP "$keep")
 	echo >&2 "$result"
-}	
+}
 
-get_images_to_reap() {
-	declare containers_all="$1" containers_reap="$2"
-	
-	local containers_keep=$(get_list_difference "$containers_all" "$containers_reap")
+# returns list of image ids to destroy
+get_images_to_destroy() {
+	declare containers_all="$1" containers_destroy="$2"
+
+	local containers_keep=$(get_list_difference "$containers_all" "$containers_destroy")
 	local images_inuse=""
 
 	if [ -n "$containers_keep" ]; then
@@ -187,12 +214,12 @@ get_images_to_reap() {
 					local d_id=$(echo "$data" | cut -d ' ' -f2 | cut -c1-12)
 					printf >&2 "%12s %s\n" "$d_id" "$d_name"
 				fi
-			done		
+			done
 		fi
 
 		images_inuse=$(echo "$containers_keep" | \
 		               xargs -n 1 docker inspect -f '{{.Config.Image}}' 2>/dev/null | \
-                               sort | uniq | \
+		               sort | uniq | \
 		               xargs -n 1 docker inspect -f '{{.Id}}' 2>/dev/null | \
 		               sort | uniq) || true
 	else
@@ -200,8 +227,8 @@ get_images_to_reap() {
 			echo >&2 "[keeping containers] NONE"
 		fi
 	fi
-	
-	local images_all=$(docker images -q --no-trunc | sort | uniq) || true	
+
+	local images_all=$(docker images -q --no-trunc | sort | uniq) || true
 	local targets=$(get_list_difference "$images_all" "$images_inuse")
 	local excluded=$(compute_excluded_image_ids)
 
@@ -221,66 +248,91 @@ get_images_to_reap() {
 	fi
 }
 
+# central processing function aka DO IT
 process_all() {
 	local containers_all=$(docker ps -a -q --no-trunc | sort | uniq) || true
-	local containers_reap=$(get_containers_to_reap "$containers_all")
-	local images_reap=$(get_images_to_reap "$containers_all" "$containers_reap")
+	local containers_destroy=$(get_containers_to_destroy "$containers_all")
+	local images_destroy=$(get_images_to_destroy "$containers_all" "$containers_destroy")
 
-	if [ -n "$UT_PERFORM_REAPING" ]; then
-		# Reap containers
-		echo "$containers_reap" | xargs -n 1 docker rm --volumes=true  &>/dev/null || true
+	if [ -n "$UT_TAKE_UNDER" ]; then
+		# destroy containers
+		echo "$containers_destroy" | xargs -n 1 docker rm --volumes=true  &>/dev/null || true
 
-		# Reap images
-		echo "$images_reap" | xargs -n 1 docker rmi  &>/dev/null || true
+		# destroy images
+		echo "$images_destroy" | xargs -n 1 docker rmi  &>/dev/null || true
 	else
-		echo "[INFO] nothing reaped. specify '-x' to perform reaping." 
+		echo "[INFO] nothing removed. specify '-x' to perform removal."
 	fi
 }
 
+# prints usage text to stdout
 show_usage() {
 	cat <<- END_OF_TEXT
-		USAGE: $0 [OPTIONS]
+	USAGE: ./undertaker [OPTIONS]
 
-		options:
-		
-		  -i pattern   exclude matching images from reaping
-		  -c pattern   exclude matching containers from reaping
-		  -e           show processed exclude lists
-		  -E           show excluded containers and images
-		  -w seconds   wait time in seconds before reaping stopped containers
-		               (default: $UT_STILLWARM_SECONDS)
-		  -x           PERFORM reaping - for safety reasons reaping is not done
-		               automatically. you have to specify this flag
+	options:
 
-		NOTE: exclusion patterns will be processed with grep against the
-		      corresponding lists
+	  -i pattern   exclude matching images from destruction
+	  -c pattern   exclude matching containers from destruction
+	  -e           show processed exclude lists
+	  -E           show excluded containers and images
+	  -w seconds   wait time in seconds before destroying stopped containers
+	               (default: 3600)
+	  -x           PERFORM cleanup - for safety reasons no container or image
+	               removal is performed automatically unless you specify this flag
+	  -v           show version info and exit
 
-		environment variables:
+	NOTE: exclusion patterns will be processed with grep against the
+	      corresponding lists
 
-		  TRACE                 turn on line-level tracing
-		  UT_IMAGE_EXCLUDES     file containing image excludes
-		                        (default: $UT_IMAGE_EXCLUDES)
-		  UT_CONTAINER_EXCLUDES file containing container excludes
-		                        (default: $UT_CONTAINER_EXCLUDES)
-		  UT_STILLWARM_SECONDS  how long will be containers ignored after exit,
-		                        same as option -w (default: $UT_STILLWARM_SECONDS)
+	environment variables:
 
-		END_OF_TEXT
+	  TRACE                 turn on line-level tracing
+	  UT_IMAGE_EXCLUDES     file containing image excludes
+	                        (default: /etc/undertaker/image-excludes)
+	  UT_CONTAINER_EXCLUDES file containing container excludes
+	                        (default: /etc/undertaker/container-excludes)
+	  UT_STILLWARM_SECONDS  how long will be containers ignored after exit,
+	                        same as option -w (default: 3600)
+	END_OF_TEXT
 }
 
+# main entry point (commandline options parsing and setup)
 main() {
 	if [ $# -eq 0 ]; then 
 		show_usage
 		exit 1
 	fi
-	
-	while getopts ":i:c:w:eEx" opt; do
+
+	while getopts ":i:c:w:eExv" opt; do
 		case $opt in
 			i)	# exclude images
-				echo "$OPTARG" >> "$UT_IMAGE_EXCLUDES"
+				if [ -f "$UT_IMAGE_EXCLUDES" ]; then
+					echo "$OPTARG" >> "$UT_IMAGE_EXCLUDES"
+				else
+					echo "[ERROR] file [$UT_IMAGE_EXCLUDES] not found."
+					exit 2
+				fi
 				;;
 			c)	# exclude containers
-				echo "$OPTARG" >> "$UT_CONTAINER_EXCLUDES"
+				if [ -f "$UT_CONTAINER_EXCLUDES" ]; then
+					echo "$OPTARG" >> "$UT_CONTAINER_EXCLUDES"
+				else
+					echo "[ERROR] file [$UT_CONTAINER_EXCLUDES] not found."
+					exit 2
+				fi
+				;;
+			v)	# show version
+				local prefix=$(dirname "$0")
+				local repo_and_version="$prefix/REPO_AND_VERSION"
+
+				if [ -f "$repo_and_version" ]; then
+					local content=$(cat $repo_and_version)
+					echo $content | sed 's/.*:\(.*\)*$/\1/'
+				else
+					echo "file [$repo_and_version] not found"
+				fi
+				exit 0
 				;;
 			w)	# wait time in seconds
 				UT_STILLWARM_SECONDS="$OPTARG"
@@ -292,7 +344,7 @@ main() {
 				UT_SHOW_EXCLUDED_TARGETS="on"
 				;;
 			x)	# perform reaping
-				UT_PERFORM_REAPING="on"
+				UT_TAKE_UNDER="on"
 				;;
 
 			\?)
@@ -309,5 +361,6 @@ main() {
 	process_all
 }
 
+# let the fun start
 main "$@"
 
