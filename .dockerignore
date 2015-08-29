@@ -1,6 +1,5 @@
 .git
 LICENSE
-REPO_AND_VERSION
 *.md
 build
 start
