@@ -21,7 +21,7 @@ RUN export DOCKER_VERSION="1.8.1" && apk -U add bash curl grep \
  && apk del curl \
  && rm /var/cache/apk/*
 
-COPY ./undertaker /undertaker
+COPY ./undertaker ./REPO_AND_VERSION /
 COPY ./image-excludes ./container-excludes /etc/undertaker/
 
 ENTRYPOINT ["/undertaker"]
