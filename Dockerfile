@@ -8,7 +8,7 @@
 # (*) has to be started with docker socket bind-mounted:
 #       docker run --rm \
 #              -v /var/run/docker.sock:/var/run/docker.sock \
-#              tnussb/undertaker:3.2
+#              tnussb/undertaker:X.Y.Z
 # 
 ################################################################################
 FROM gliderlabs/alpine:3.2
